@@ -792,6 +792,21 @@ async def get_video_generation(
 
     return response_body
 
+# 兼容 NewAPI 默认路由 `/v1/videos` 的别名
+@app.post("/v1/videos")
+async def create_video_generation_alias(
+    request: VideoGenerationRequest,
+    authorization: Optional[str] = Header(None)
+):
+    return await create_video_generation(request, authorization)
+
+@app.get("/v1/videos/{task_id}")
+async def get_video_generation_alias(
+    task_id: str,
+    authorization: Optional[str] = Header(None)
+):
+    return await get_video_generation(task_id, authorization)
+
 @app.get("/health")
 async def health_check():
     """健康检查端点"""
