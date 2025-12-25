@@ -11,6 +11,7 @@ import dashscope
 from dashscope import Generation
 import time
 import uuid
+import httpx
 
 # 配置日志
 logging.basicConfig(
@@ -78,6 +79,21 @@ class ChatCompletionStreamResponse(BaseModel):
     model: str
     choices: List[ChatCompletionStreamChoice]
 
+# NewAPI 视频生成请求格式
+class VideoGenerationRequest(BaseModel):
+    model: str
+    prompt: Optional[str] = None
+    image: Optional[str] = None  # 参考图/首帧
+    duration: Optional[float] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    fps: Optional[int] = None
+    seed: Optional[int] = None
+    n: Optional[int] = 1
+    response_format: Optional[str] = None
+    user: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None  # 透传附加控制参数
+
 def hash_api_key(api_key: str) -> str:
     """对API密钥进行哈希处理，用于日志记录（保护隐私）"""
     return hashlib.md5(api_key.encode()).hexdigest()[:8]
@@ -96,6 +112,104 @@ def convert_openai_to_dashscope_messages(messages: List[ChatMessage]) -> List[Di
             "content": message.content
         })
     return dashscope_messages
+
+def map_dashscope_task_status(status: Optional[str]) -> str:
+    """将DashScope任务状态转换为NewAPI状态"""
+    status = (status or "").upper()
+    if status in ("PENDING", "QUEUED"):
+        return "queued"
+    if status in ("RUNNING", "DOING", "PRE-PROCESSING", "POST-PROCESSING", "PROCESSING"):
+        return "in_progress"
+    if status in ("SUCCEEDED", "SUCCESS", "COMPLETED", "FINISHED"):
+        return "completed"
+    if status in ("FAILED", "FAILURE", "CANCELED", "CANCELLED"):
+        return "failed"
+    return "queued"
+
+def build_dashscope_video_payload(request: VideoGenerationRequest) -> Dict[str, Any]:
+    """构建DashScope视频生成请求体"""
+    input_block: Dict[str, Any] = {}
+    params: Dict[str, Any] = {}
+
+    if request.prompt:
+        input_block["prompt"] = request.prompt
+    if request.image:
+        # DashScope I2V 使用 img_url
+        input_block["img_url"] = request.image
+
+    if request.duration is not None:
+        params["duration"] = request.duration
+    if request.width and request.height:
+        params["size"] = f"{request.width}*{request.height}"
+    if request.fps is not None:
+        params["frame_rate"] = request.fps
+    if request.seed is not None:
+        params["seed"] = request.seed
+
+    # 透传 metadata 中的已知控制字段
+    if request.metadata:
+        known_input_keys = {"negative_prompt", "prompt_extend", "reference_img", "reference_video_urls", "audio_url", "first_frame_url", "last_frame_url", "video_url"}
+        for key, value in request.metadata.items():
+            if value is None:
+                continue
+            if key in known_input_keys:
+                input_block[key] = value
+            else:
+                params[key] = value
+
+    payload: Dict[str, Any] = {
+        "model": request.model,
+        "input": input_block
+    }
+    if params:
+        payload["parameters"] = params
+    return payload
+
+def parse_video_metadata(output: Dict[str, Any]) -> Dict[str, Any]:
+    """抽取视频元信息，兼容不同返回字段"""
+    meta: Dict[str, Any] = {}
+    duration = output.get("duration") or output.get("video_duration")
+    fps = output.get("frame_rate") or output.get("fps")
+    size = output.get("size")
+    resolution = output.get("resolution")
+
+    if duration is not None:
+        meta["duration"] = duration
+    if fps is not None:
+        meta["fps"] = fps
+
+    width = height = None
+    if isinstance(size, str) and "*" in size:
+        try:
+            width, height = [int(x) for x in size.split("*", 1)]
+        except Exception:
+            width = height = None
+    if not width and isinstance(resolution, str) and "x" in resolution.lower():
+        try:
+            width, height = [int(x) for x in resolution.lower().split("x", 1)]
+        except Exception:
+            width = height = None
+    if width is not None:
+        meta["width"] = width
+    if height is not None:
+        meta["height"] = height
+
+    seed = output.get("seed")
+    if seed is not None:
+        meta["seed"] = seed
+    return meta
+
+def extract_video_url(output: Dict[str, Any]) -> Optional[str]:
+    """从DashScope返回中提取视频地址"""
+    if "video_url" in output and output["video_url"]:
+        return output["video_url"]
+    if "url" in output and output["url"]:
+        return output["url"]
+    if "results" in output and isinstance(output["results"], list) and output["results"]:
+        first = output["results"][0]
+        if isinstance(first, dict):
+            return first.get("url") or first.get("video_url")
+    return None
 
 def get_api_key_from_header(authorization: Optional[str] = None) -> str:
     """从Header中提取API Key"""
@@ -548,6 +662,135 @@ async def stream_chat_completion(dashscope_params: Dict[str, Any], model: str, r
             "error": {"message": str(e)}
         }
         yield f"data: {json.dumps(error_chunk)}\n\n"
+
+@app.post("/v1/video/generations")
+async def create_video_generation(
+    request: VideoGenerationRequest,
+    authorization: Optional[str] = Header(None)
+):
+    """兼容NewAPI的视频生成创建接口，转发到DashScope异步视频生成"""
+    request_id = f"vid-{uuid.uuid4().hex[:8]}"
+    api_key = get_api_key_from_header(authorization)
+    api_key_hash = hash_api_key(api_key)
+
+    dashscope_api = f"{DASHSCOPE_BASE_URL}/api/v1/services/aigc/video-generation/video-synthesis"
+    payload = build_dashscope_video_payload(request)
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "X-DashScope-Async": "enable"
+    }
+
+    logger.info(f"[{request_id}] Create video task - Model: {request.model}, API Key Hash: {api_key_hash}")
+    logger.info(f"[{request_id}] DashScope video payload: {json.dumps(payload, ensure_ascii=False)}")
+
+    async with httpx.AsyncClient(timeout=180) as client:
+        resp = await client.post(dashscope_api, headers=headers, json=payload)
+
+    if resp.status_code != 200:
+        try:
+            detail = resp.json()
+            message = detail.get("message") or detail.get("error", {}).get("message") or resp.text
+            code = detail.get("code") or detail.get("error", {}).get("code")
+        except Exception:
+            detail = None
+            message = resp.text
+            code = "dashscope_error"
+        logger.error(f"[{request_id}] DashScope video API error {resp.status_code}: {message}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": {
+                    "message": f"DashScope video API error: {message}",
+                    "type": "dashscope_error",
+                    "code": code or resp.status_code
+                }
+            }
+        )
+
+    resp_json = resp.json()
+    output = resp_json.get("output", {})
+    task_id = output.get("task_id") or resp_json.get("task_id")
+    task_status = output.get("task_status") or output.get("status") or resp_json.get("task_status") or resp_json.get("status")
+
+    if not task_id:
+        logger.error(f"[{request_id}] Missing task_id in DashScope response: {resp_json}")
+        raise HTTPException(
+            status_code=500,
+            detail={"error": {"message": "DashScope response missing task_id", "type": "dashscope_error", "code": "missing_task_id"}}
+        )
+
+    status_mapped = map_dashscope_task_status(task_status)
+    return {"task_id": task_id, "status": status_mapped}
+
+@app.get("/v1/video/generations/{task_id}")
+async def get_video_generation(
+    task_id: str,
+    authorization: Optional[str] = Header(None)
+):
+    """兼容NewAPI的视频任务查询接口，轮询DashScope任务状态"""
+    request_id = f"vidq-{uuid.uuid4().hex[:8]}"
+    api_key = get_api_key_from_header(authorization)
+    api_key_hash = hash_api_key(api_key)
+
+    url = f"{DASHSCOPE_BASE_URL}/api/v1/tasks/{task_id}"
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    logger.info(f"[{request_id}] Query video task {task_id} - API Key Hash: {api_key_hash}")
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.get(url, headers=headers)
+
+    if resp.status_code != 200:
+        try:
+            detail = resp.json()
+            message = detail.get("message") or detail.get("error", {}).get("message") or resp.text
+            code = detail.get("code") or detail.get("error", {}).get("code")
+        except Exception:
+            detail = None
+            message = resp.text
+            code = "dashscope_error"
+        logger.error(f"[{request_id}] DashScope task query error {resp.status_code}: {message}")
+        raise HTTPException(
+            status_code=resp.status_code if resp.status_code != 401 else 401,
+            detail={
+                "error": {
+                    "message": f"DashScope task query error: {message}",
+                    "type": "dashscope_error",
+                    "code": code or resp.status_code
+                }
+            }
+        )
+
+    resp_json = resp.json()
+    output = resp_json.get("output", {})
+    task_status = output.get("task_status") or output.get("status") or resp_json.get("task_status") or resp_json.get("status")
+    status_mapped = map_dashscope_task_status(task_status)
+    video_url = extract_video_url(output)
+    metadata = parse_video_metadata(output)
+
+    # 补充格式信息
+    video_format = None
+    if video_url and "." in video_url.split("/")[-1]:
+        ext = video_url.split("/")[-1].split(".")[-1]
+        if ext:
+            video_format = ext
+
+    error_block = None
+    if status_mapped == "failed":
+        message = output.get("message") or resp_json.get("message")
+        error_block = {"code": output.get("code") or resp_json.get("code"), "message": message}
+
+    response_body = {
+        "task_id": task_id,
+        "status": status_mapped,
+        "url": video_url,
+        "format": video_format,
+        "metadata": metadata or None,
+        "error": error_block
+    }
+
+    return response_body
 
 @app.get("/health")
 async def health_check():
