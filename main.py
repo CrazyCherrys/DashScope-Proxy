@@ -3,8 +3,8 @@ import json
 import logging
 import hashlib
 from typing import List, Optional, Dict, Any, AsyncGenerator
-from fastapi import FastAPI, HTTPException, Header, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Header, Request, UploadFile, File, Form
+from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import dashscope
@@ -93,6 +93,36 @@ class VideoGenerationRequest(BaseModel):
     response_format: Optional[str] = None
     user: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None  # 透传附加控制参数
+
+# OpenAI 兼容视频响应
+def build_openai_video_response(
+    task_id: str,
+    status: str,
+    model: Optional[str] = None,
+    created_at: Optional[int] = None,
+    progress: Optional[int] = None,
+    url: Optional[str] = None,
+    format: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    error: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    resp = {
+        "id": task_id,
+        "object": "video",
+        "model": model or "",
+        "status": status,
+        "progress": progress if progress is not None else (100 if status == "completed" else 0),
+        "created_at": created_at if created_at is not None else int(time.time()),
+    }
+    if url:
+        resp["url"] = url
+    if format:
+        resp["format"] = format
+    if metadata:
+        resp["metadata"] = metadata
+    if error:
+        resp["error"] = error
+    return resp
 
 def hash_api_key(api_key: str) -> str:
     """对API密钥进行哈希处理，用于日志记录（保护隐私）"""
@@ -210,6 +240,18 @@ def extract_video_url(output: Dict[str, Any]) -> Optional[str]:
         if isinstance(first, dict):
             return first.get("url") or first.get("video_url")
     return None
+
+def parse_size_to_wh(size: Optional[str]) -> (Optional[int], Optional[int]):
+    if not size:
+        return None, None
+    sep = "x" if "x" in size.lower() else "*"
+    try:
+        parts = size.lower().split(sep)
+        if len(parts) == 2:
+            return int(parts[0]), int(parts[1])
+    except Exception:
+        return None, None
+    return None, None
 
 def get_api_key_from_header(authorization: Optional[str] = None) -> str:
     """从Header中提取API Key"""
@@ -800,17 +842,117 @@ async def get_video_generation(
 # 兼容 NewAPI 默认路由 `/v1/videos` 的别名
 @app.post("/v1/videos")
 async def create_video_generation_alias(
-    request: VideoGenerationRequest,
-    authorization: Optional[str] = Header(None)
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    prompt: Optional[str] = Form(None),
+    model: Optional[str] = Form(None),
+    seconds: Optional[str] = Form(None),
+    size: Optional[str] = Form(None),
+    input_reference: Optional[UploadFile] = File(None),
+    metadata: Optional[str] = Form(None)
 ):
-    return await create_video_generation(request, authorization)
+    """
+    OpenAI 兼容视频创建端点，支持 multipart/form-data（OpenAI Sora 格式）和 JSON 两种方式。
+    """
+    content_type = request.headers.get("content-type", "").lower()
+
+    # multipart/form-data 分支
+    if "multipart/form-data" in content_type:
+        meta_dict = None
+        if metadata:
+            try:
+                meta_dict = json.loads(metadata)
+            except Exception:
+                raise HTTPException(status_code=400, detail={"error": {"message": "metadata 必须是 JSON 字符串"}})
+
+        width, height = parse_size_to_wh(size)
+
+        # 文件暂不支持直接上传到 DashScope，提示用户使用 URL
+        if input_reference:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": {"message": "当前版本暂不支持直接上传文件，请提供可访问的图像/视频 URL（metadata.reference_img 或 metadata.reference_video_urls）"}}
+            )
+
+        req = VideoGenerationRequest(
+            model=model or "wan2.6-t2v",
+            prompt=prompt,
+            duration=float(seconds) if seconds else None,
+            width=width,
+            height=height,
+            metadata=meta_dict
+        )
+        base_resp = await create_video_generation(req, authorization)
+        return build_openai_video_response(
+            task_id=base_resp.get("task_id"),
+            status=base_resp.get("status"),
+            model=req.model,
+            created_at=int(time.time())
+        )
+
+    # JSON 分支（兼容旧调用）
+    body = await request.json()
+    try:
+        req = VideoGenerationRequest(**body)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail={"error": {"message": f"请求体解析失败: {str(e)}"}})
+    base_resp = await create_video_generation(req, authorization)
+    return build_openai_video_response(
+        task_id=base_resp.get("task_id"),
+        status=base_resp.get("status"),
+        model=req.model,
+        created_at=int(time.time())
+    )
 
 @app.get("/v1/videos/{task_id}")
 async def get_video_generation_alias(
     task_id: str,
     authorization: Optional[str] = Header(None)
 ):
-    return await get_video_generation(task_id, authorization)
+    base_resp = await get_video_generation(task_id, authorization)
+    return build_openai_video_response(
+        task_id=task_id,
+        status=base_resp.get("status"),
+        model=base_resp.get("model"),
+        created_at=int(time.time()),
+        url=base_resp.get("url"),
+        format=base_resp.get("format"),
+        metadata=base_resp.get("metadata"),
+        error=base_resp.get("error")
+    )
+
+@app.get("/v1/videos/{task_id}/content")
+async def get_video_content(
+    task_id: str,
+    authorization: Optional[str] = Header(None)
+):
+    """
+    OpenAI 兼容的视频内容获取接口：返回视频二进制流。
+    """
+    # 复用查询逻辑，确保同一 key 与域名
+    api_key = get_api_key_from_header(authorization)
+    url = f"{DASHSCOPE_BASE_URL}/api/v1/tasks/{task_id}"
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.get(url, headers=headers)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail={"error": {"message": resp.text}})
+
+    data = resp.json()
+    output = data.get("output", {})
+    video_url = extract_video_url(output)
+    status = map_dashscope_task_status(output.get("task_status") or output.get("status") or data.get("task_status"))
+    if status != "completed" or not video_url:
+        raise HTTPException(status_code=404, detail={"error": {"message": "Video not ready"}})
+
+    # 代理视频流
+    async with httpx.AsyncClient(timeout=None) as client:
+        upstream = await client.get(video_url, follow_redirects=True)
+        if upstream.status_code != 200:
+            raise HTTPException(status_code=upstream.status_code, detail={"error": {"message": "Failed to fetch video content"}})
+        content_type = upstream.headers.get("content-type", "video/mp4")
+        return StreamingResponse(upstream.aiter_bytes(), media_type=content_type)
 
 @app.get("/health")
 async def health_check():
