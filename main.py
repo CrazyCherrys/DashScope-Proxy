@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 # DashScope 配置
 DASHSCOPE_BASE_URL = os.getenv('DASHSCOPE_BASE_URL', 'https://dashscope.aliyuncs.com')
+APP_VERSION = os.getenv('APP_VERSION', 'unknown')
 
 app = FastAPI(
     title="DashScope to OpenAI API Gateway",
@@ -329,6 +330,7 @@ async def root():
     return {
         "message": "DashScope to OpenAI API Gateway is running",
         "version": "1.0.0",
+        "app_version": APP_VERSION,
         "description": "公共服务 - 将阿里百炼DashScope API转换为OpenAI API格式",
         "dashscope_endpoint": DASHSCOPE_BASE_URL,
         "usage": {
@@ -960,7 +962,8 @@ async def health_check():
     return {
         "status": "healthy",
         "timestamp": int(time.time()),
-        "service": "DashScope to OpenAI API Gateway"
+        "service": "DashScope to OpenAI API Gateway",
+        "app_version": APP_VERSION
     }
 
 @app.exception_handler(HTTPException)
@@ -1007,5 +1010,5 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("Starting DashScope to OpenAI API Gateway...")
+    logger.info(f"Starting DashScope to OpenAI API Gateway... version={APP_VERSION}, dashscope_base={DASHSCOPE_BASE_URL}")
     uvicorn.run(app, host="0.0.0.0", port=8000) 
