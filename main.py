@@ -763,11 +763,16 @@ async def get_video_generation(
         )
 
     resp_json = resp.json()
+    logger.info(f"[{request_id}] Task query raw response: {json.dumps(resp_json, ensure_ascii=False)[:1000]}")
     output = resp_json.get("output", {})
     task_status = output.get("task_status") or output.get("status") or resp_json.get("task_status") or resp_json.get("status")
     status_mapped = map_dashscope_task_status(task_status)
     video_url = extract_video_url(output)
     metadata = parse_video_metadata(output)
+
+    # 若已拿到视频地址但状态仍未完成，主动提升为 completed，避免队列状态卡住
+    if video_url and status_mapped in ("queued", "in_progress"):
+        status_mapped = "completed"
 
     # 补充格式信息
     video_format = None
